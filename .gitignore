@@ -51,6 +51,10 @@ coverage.xml
 .pytest_cache/
 cover/
 
+# Data
+data/raw/*.las
+data/raw/*.las.bak
+
 # Jupyter Notebook
 .ipynb_checkpoints
 
