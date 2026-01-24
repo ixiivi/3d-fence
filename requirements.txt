@@ -1,3 +1,5 @@
 open3d
 laspy[lazrs]
 matplotlib
+scipy
+scikit-learn
