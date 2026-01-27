@@ -3,3 +3,4 @@ laspy[lazrs]
 matplotlib
 scipy
 scikit-learn
+google-generativeai
