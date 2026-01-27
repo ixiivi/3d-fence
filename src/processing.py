@@ -25,9 +25,9 @@ def convert_to_hsv(pcd):
 
 def separate_background_and_object(source, target, hue_threshold=0.1, dist_threshold=0.1, voxel_size=0.05):
     """
-    고급 분류 로직: Geometry + Color(H+S) + Clustering(DBSCAN)
+    고급 분류 로직: Geometry + Color(H+S) + Scalable DBSCAN
     """
-    print(":: Separating Background and Object (Advanced Mode)...")
+    print(":: Separating Background and Object (Scalable Mode)...")
     
     # 1. Prepare Data
     tgt_tree = cKDTree(np.asarray(target.points))
@@ -45,84 +45,111 @@ def separate_background_and_object(source, target, hue_threshold=0.1, dist_thres
     corrected_points = src_points.copy()
     
     # 2. 1차 분류 (Distance & Color)
-    # Bulk query for speed
+    # Bulk query
     dists, indices = tgt_tree.query(src_points, k=1, workers=-1)
     
-    for i in range(count):
+    # Vectorized checks would be faster, but let's stick to readable loop or logical indexing for hybrid check
+    # Let's try vectorized approach for "potential background"
+    
+    # Distance check
+    mask_dist = dists <= dist_threshold
+    
+    # Color check (can be complex, iterate only potential candidates)
+    # To keep logic simple and robust, we iterate indices where distance is okay
+    
+    # Pre-calculate candidates
+    candidate_indices = np.where(mask_dist)[0]
+    
+    match_count = 0
+    
+    # Loop Optimization: Only iterate candidates
+    for i in candidate_indices:
         tgt_idx = indices[i]
-        dist = dists[i]
         
-        # Condition A: Distance
-        if dist > dist_threshold:
-            continue # Object
-            
-        # Condition B: Color (Hue & Saturation)
-        # 스툴은 회색(Low Saturation), 람보는 유채색(High Saturation)일 가능성 높음
+        # Color Check
         if src_hsv is not None and tgt_hsv is not None:
-            s_src = src_hsv[i, 1] # Saturation
+            s_src = src_hsv[i, 1]
             s_tgt = tgt_hsv[tgt_idx, 1]
-            
-            # Saturation 차이가 크면 다른 물체 (예: 회색 vs 노랑)
-            sat_diff = abs(s_src - s_tgt)
-            if sat_diff > 0.3: # 채도 차이가 30% 이상이면
-                 continue # Object
+            if abs(s_src - s_tgt) > 0.3: continue
             
             h_src = src_hsv[i, 0]
             h_tgt = tgt_hsv[tgt_idx, 0]
             hue_diff = abs(h_src - h_tgt)
             if hue_diff > 0.5: hue_diff = 1.0 - hue_diff
+            if hue_diff > hue_threshold: continue
             
-            if hue_diff > hue_threshold:
-                continue # Object
-        
-        # Condition C: Normal (Geometry)
+        # Geometry Correction
         n_tgt = tgt_normals[tgt_idx]
         p_src = src_points[i]
         p_tgt = np.asarray(target.points)[tgt_idx]
         
-        # Projection Correction
         vec = p_src - p_tgt
         dist_plane = np.dot(vec, n_tgt)
         
         corrected_points[i] = p_src - (dist_plane * n_tgt)
         is_background[i] = True
+        match_count += 1
 
-    # 3. 2차 분류: DBSCAN Clustering (Refinement)
-    # Object로 분류된 점들 중에서 "노이즈(작은 점들)"를 걸러내고, "진짜 덩어리"만 남김
-    print(":: Refining Object Cluster (DBSCAN)...")
+    # 3. 2차 분류: Scalable DBSCAN Clustering
+    print(":: Refining Object Cluster (Scalable DBSCAN)...")
     
     obj_indices = np.where(~is_background)[0]
-    if len(obj_indices) > 0:
+    num_obj = len(obj_indices)
+    
+    if num_obj > 0:
         obj_points = src_points[obj_indices]
         
-        # DBSCAN: eps=거리, min_samples=최소 점 개수
-        # 람보르기니 같은 덩어리는 밀도가 높아야 함
-        db = DBSCAN(eps=voxel_size * 2, min_samples=20).fit(obj_points)
-        labels = db.labels_
+        # A. Downsampling for Speed (Proxy Points)
+        # Create a temporary Open3D PCD for voxel downsampling
+        tmp_pcd = o3d.geometry.PointCloud()
+        tmp_pcd.points = o3d.utility.Vector3dVector(obj_points)
         
-        # Label -1은 노이즈
-        noise_mask = (labels == -1)
+        # 다운샘플링 (voxel_size의 2배 정도로 듬성듬성하게)
+        # 10만 개 -> 수천 개로 줄임
+        proxy_pcd = tmp_pcd.voxel_down_sample(voxel_size=voxel_size * 2)
+        proxy_points = np.asarray(proxy_pcd.points)
         
-        # 노이즈로 판명된 점들은 다시 Background로 보낼지, 아니면 아예 버릴지 결정
-        # 여기서는 "Background 후보"로 격상시키거나, 그냥 삭제.
-        # 안전하게: Background로 편입 시도 (보정 적용)
+        print(f"   - DBSCAN Input: {num_obj} points -> Downsampled to {len(proxy_points)} proxy points")
         
-        noise_real_indices = obj_indices[noise_mask]
-        
-        # 노이즈 점들에 대해 다시 가까운 Target 평면으로 붙이기 시도
-        for idx in noise_real_indices:
-            tgt_idx = indices[idx]
-            n_tgt = tgt_normals[tgt_idx]
-            p_src = src_points[idx]
-            p_tgt = np.asarray(target.points)[tgt_idx]
+        if len(proxy_points) > 0:
+            # B. Run DBSCAN on Proxy Points
+            # eps도 다운샘플링 크기에 맞춰서 키워줌
+            db = DBSCAN(eps=voxel_size * 4, min_samples=5).fit(proxy_points)
+            proxy_labels = db.labels_
             
-            vec = p_src - p_tgt
-            dist_plane = np.dot(vec, n_tgt)
+            # C. Propagate Labels to Original Points (Nearest Neighbor)
+            # KDTree of proxy points
+            proxy_tree = cKDTree(proxy_points)
+            _, nn_indices = proxy_tree.query(obj_points, k=1, workers=-1)
             
-            # 거리가 아주 멀지 않다면 Background로 구제
-            if abs(dist_plane) < dist_threshold:
-                corrected_points[idx] = p_src - (dist_plane * n_tgt)
-                is_background[idx] = True # 구제 성공
+            # 각 원본 점은 가장 가까운 Proxy 점의 라벨을 따라감
+            original_labels = proxy_labels[nn_indices]
+            
+            # D. Filter Noise
+            # Label -1 (Noise)인 점들을 구제 시도
+            noise_local_mask = (original_labels == -1)
+            noise_real_indices = obj_indices[noise_local_mask]
+            
+            reclaimed_count = 0
+            for idx in noise_real_indices:
+                tgt_idx = indices[idx] # 이미 구해둔 NN
+                dist = dists[idx]
+                
+                # 거리가 아주 멀지 않다면 Background로 편입 (구제)
+                # (원래 Background 기준보다는 조금 관대하게)
+                if dist < dist_threshold * 1.5:
+                    n_tgt = tgt_normals[tgt_idx]
+                    p_src = src_points[idx]
+                    p_tgt = np.asarray(target.points)[tgt_idx]
+                    
+                    vec = p_src - p_tgt
+                    dist_plane = np.dot(vec, n_tgt)
+                    
+                    corrected_points[idx] = p_src - (dist_plane * n_tgt)
+                    is_background[idx] = True
+                    reclaimed_count += 1
+            
+            print(f"   - Reclaimed {reclaimed_count} noise points to background.")
     
     print(f":: Final Classification - Background: {np.sum(is_background)}, Object: {count - np.sum(is_background)}")
 
