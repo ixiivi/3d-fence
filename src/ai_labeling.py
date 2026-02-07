@@ -1,6 +1,10 @@
 import google.generativeai as genai
 import os
 from PIL import Image
+from dotenv import load_dotenv
+
+# .env 파일 로드
+load_dotenv()
 
 class GeminiLabeler:
     def __init__(self):
